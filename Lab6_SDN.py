@@ -483,68 +483,72 @@ def menu_conexiones():
 
 def build_route(route, alumno, servidor, servicio):
     controller_ip = "10.20.12.162"
-    url = f"http://{controller_ip}:8080/wm/staticentrypusher/json"
+    url = f"http://{controller_ip}:8080/wm/staticflowpusher/json"
 
     protocolo = servicio['protocolo'].upper()
     puerto = int(servicio['puerto'])
     mac_src = alumno.mac
     ip_dst = servidor.ip
 
+    # Determinar protocolo L4
+    ip_proto = 6 if protocolo == "TCP" else 17  # TCP=6, UDP=17
+
     for i, hop in enumerate(route):
         dpid = hop['dpid']
         in_port = hop['in_port']
         out_port = hop['out_port']
 
-        # --- Forward direction: Alumno → Servidor
+        # --- FLOW Alumno → Servidor (match L2 + L3 + L4)
         flow_fwd = {
             "switch": dpid,
             "name": f"flow_{alumno.codigo}_to_{servidor.nombre}_{i}",
-            "priority": 40000,
+            "priority": int(40000),
             "active": True,
-            "eth_type": "0x0800",  # IPv4
+            "eth_type": "0x800",
             "eth_src": mac_src,
-            "ip_proto": 6 if protocolo == "TCP" else 17,  # TCP:6, UDP:17
+            "ip_proto": ip_proto,
             "ipv4_dst": ip_dst,
             "tp_dst": puerto,
             "in_port": in_port,
             "actions": f"output={out_port}"
         }
 
-        # --- Reverse direction: Servidor → Alumno
+        # --- FLOW Servidor → Alumno (match L2 + L3 + L4)
         flow_rev = {
             "switch": dpid,
             "name": f"flow_{servidor.nombre}_to_{alumno.codigo}_{i}",
             "priority": 40000,
             "active": True,
-            "eth_type": "0x0800",  # IPv4
+            "eth_type": "0x800",
+            "ip_proto": ip_proto,
             "ipv4_src": ip_dst,
             "tp_src": puerto,
-            "ip_proto": 6 if protocolo == "TCP" else 17,
             "eth_dst": mac_src,
             "in_port": out_port,
             "actions": f"output={in_port}"
         }
 
-        # --- ARP Forward
+        # --- FLOW ARP Alumno → Servidor
         flow_arp_fwd = {
             "switch": dpid,
             "name": f"arp_{alumno.codigo}_{i}",
             "priority": 10000,
-            "eth_type": "0x0806",
+            "eth_type": "0x806",
             "in_port": in_port,
             "actions": f"output={out_port}"
         }
 
-        # --- ARP Reverse
+        # --- FLOW ARP Servidor → Alumno
         flow_arp_rev = {
             "switch": dpid,
             "name": f"arp_{servidor.nombre}_{i}",
             "priority": 10000,
-            "eth_type": "0x0806",
+            "eth_type": "0x806",
             "in_port": out_port,
             "actions": f"output={in_port}"
         }
 
+        # Enviar todos los flows
         for flow in [flow_fwd, flow_rev, flow_arp_fwd, flow_arp_rev]:
             response = requests.post(url, data=json.dumps(flow), headers={'Content-Type': 'application/json'})
             if response.status_code != 200:
@@ -642,6 +646,10 @@ def get_attachment_point(mac):
 FLOODLIGHT_URL = "http://10.20.12.162:8080"
 
 def get_route(mac_src, mac_dst):
+    """
+    Determina la ruta entre dos hosts usando BFS a nivel de switches.
+    Retorna una lista de hops con dpid, in_port y out_port.
+    """
 
     def obtener_punto_de_conexion(mac_o_ip):
         url = f"{FLOODLIGHT_URL}/wm/device/"
@@ -652,19 +660,19 @@ def get_route(mac_src, mac_dst):
 
             for dispositivo in dispositivos:
                 # Buscar por MAC
-                for m in dispositivo.get("mac", []):
-                    if mac_o_ip.lower() == m.lower():
-                        puntos = dispositivo.get("attachmentPoint", [])
-                        if puntos:
-                            return puntos[0]["switchDPID"], puntos[0]["port"]
+                if mac_o_ip.lower() in [m.lower() for m in dispositivo.get("mac", [])]:
+                    puntos = dispositivo.get("attachmentPoint", [])
+                    if puntos:
+                        return puntos[0]["switchDPID"], puntos[0]["port"]
                 # Buscar por IP
-                for ip in dispositivo.get("ipv4", []):
-                    if mac_o_ip == ip:
-                        puntos = dispositivo.get("attachmentPoint", [])
-                        if puntos:
-                            return puntos[0]["switchDPID"], puntos[0]["port"]
+                if mac_o_ip in dispositivo.get("ipv4", []):
+                    puntos = dispositivo.get("attachmentPoint", [])
+                    if puntos:
+                        return puntos[0]["switchDPID"], puntos[0]["port"]
+            print(f"[!] El valor {mac_o_ip} no se encuentra conectado (ni como MAC ni como IP).")
+            return None
         except requests.RequestException as e:
-            print("[!] Error al contactar al controlador:", e)
+            print("[!] Error al contactar al controlador Floodlight:", e)
             return None
 
 
@@ -675,7 +683,7 @@ def get_route(mac_src, mac_dst):
             respuesta.raise_for_status()
             return respuesta.json()
         except requests.RequestException as e:
-            print("[!] Error al obtener la topología:", e)
+            print("[!] Error al obtener los enlaces de topología:", e)
             return []
 
     def construir_grafo(enlaces):
@@ -686,9 +694,10 @@ def get_route(mac_src, mac_dst):
             port_src = enlace["src-port"]
             port_dst = enlace["dst-port"]
             grafo[src].append((dst, port_src, port_dst))
+            grafo[dst].append((src, port_dst, port_src))  # bidireccional
         return grafo
 
-    def buscar_ruta(grafo, inicio, fin):
+    def buscar_ruta_bfs(grafo, inicio, fin):
         cola = deque([(inicio, [])])
         visitados = set()
 
@@ -707,7 +716,7 @@ def get_route(mac_src, mac_dst):
 
         return None
 
-    def obtener_detalle_de_ruta(ruta, grafo, puerto_final):
+    def obtener_ruta_detallada(ruta, grafo, puerto_final):
         path = []
         for i in range(len(ruta) - 1):
             origen = ruta[i]
@@ -741,10 +750,10 @@ def get_route(mac_src, mac_dst):
 
     enlaces = obtener_enlaces_topologia()
     grafo = construir_grafo(enlaces)
-    ruta = buscar_ruta(grafo, dpid_src, dpid_dst)
+    ruta = buscar_ruta_bfs(grafo, dpid_src, dpid_dst)
 
     if ruta:
-        return obtener_detalle_de_ruta(ruta, grafo, port_dst)
+        return obtener_ruta_detallada(ruta, grafo, port_dst)
     else:
         print("[X] No se encontró una ruta en la topología.")
         return None
@@ -773,7 +782,7 @@ def borrar_conexion():
         return
 
     controller_ip = "10.20.12.162"
-    url = f"http://{controller_ip}:8080/wm/staticentrypusher/json"
+    url = f"http://{controller_ip}:8080/wm/staticflowpusher/json"
 
     for i, hop in enumerate(c.ruta):
         names = [
